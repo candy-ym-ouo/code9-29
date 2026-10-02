@@ -101,37 +101,45 @@ export async function restoreBackup(name: string, confirm: boolean): Promise<{ s
   return { safetyBackup: safety.name };
 }
 
-/** 全量导出（含精确坐标，仅 owner，用于数据自持；文档 13.3 允许） */
+/**
+ * 全量导出（含精确坐标，仅 owner，用于数据自持；文档 13.3 允许）
+ *
+ * 隔离原则（fail-closed）：每张表必须显式声明"如何限定在当前库"——
+ * 有 library_id 的表直接过滤；没有 library_id 的关联表按父表归属过滤，
+ * 且双外键的关联行两端都必须落在本库内（不允许越界引用其他库的记录）。
+ * 未在此声明的表一律不导出，宁可漏导，不可带出其他库的数据。
+ */
+const EXPORT_SCOPED_QUERIES: Record<string, string> = {
+  inspiration: 'SELECT * FROM inspiration WHERE library_id = ?',
+  asset: 'SELECT * FROM asset WHERE library_id = ?',
+  tag: 'SELECT * FROM tag WHERE library_id = ?',
+  inspiration_tag: `SELECT * FROM inspiration_tag
+    WHERE inspiration_id IN (SELECT id FROM inspiration WHERE library_id = ?)
+      AND tag_id IN (SELECT id FROM tag WHERE library_id = ?)`,
+  composition_note: 'SELECT * FROM composition_note WHERE library_id = ?',
+  timing: 'SELECT * FROM timing WHERE library_id = ?',
+  repro_window: 'SELECT * FROM repro_window WHERE library_id = ?',
+  reminder: 'SELECT * FROM reminder WHERE library_id = ?',
+  shoot_plan: 'SELECT * FROM shoot_plan WHERE library_id = ?',
+  shoot_result: 'SELECT * FROM shoot_result WHERE library_id = ?',
+  calibration_log: 'SELECT * FROM calibration_log WHERE library_id = ?',
+  album: 'SELECT * FROM album WHERE library_id = ?',
+  album_item: `SELECT * FROM album_item
+    WHERE album_id IN (SELECT id FROM album WHERE library_id = ?)
+      AND inspiration_id IN (SELECT id FROM inspiration WHERE library_id = ?)`,
+  album_gap: 'SELECT * FROM album_gap WHERE album_id IN (SELECT id FROM album WHERE library_id = ?)',
+  album_snapshot: 'SELECT * FROM album_snapshot WHERE album_id IN (SELECT id FROM album WHERE library_id = ?)',
+  share_link: 'SELECT * FROM share_link WHERE library_id = ?',
+  place: 'SELECT * FROM place WHERE library_id = ?',
+  spot: 'SELECT * FROM spot WHERE library_id = ?',
+};
+
 export function exportAll(libraryId: string): Record<string, unknown> {
   const db = getDb();
-  const tables = [
-    'inspiration',
-    'asset',
-    'tag',
-    'inspiration_tag',
-    'composition_note',
-    'timing',
-    'repro_window',
-    'reminder',
-    'shoot_plan',
-    'shoot_result',
-    'calibration_log',
-    'album',
-    'album_item',
-    'album_gap',
-    'album_snapshot',
-    'share_link',
-    'place',
-    'spot',
-  ];
   const out: Record<string, unknown> = { exportedAt: nowIso(), libraryId };
-  for (const table of tables) {
-    const hasLibrary = (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(
-      (c) => c.name === 'library_id',
-    );
-    out[table] = hasLibrary
-      ? db.prepare(`SELECT * FROM ${table} WHERE library_id = ?`).all(libraryId)
-      : db.prepare(`SELECT * FROM ${table}`).all();
+  for (const [table, sql] of Object.entries(EXPORT_SCOPED_QUERIES)) {
+    const paramCount = (sql.match(/\?/g) ?? []).length;
+    out[table] = db.prepare(sql).all(...Array<string>(paramCount).fill(libraryId));
   }
   return out;
 }

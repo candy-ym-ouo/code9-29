@@ -447,3 +447,118 @@ describe('E10 备份与质量门', () => {
     expect(Object.values(res.body.dirs).every((v) => v === 'ok')).toBe(true);
   });
 });
+
+describe('E11 导出隔离：只含当前库数据及其直接关系', () => {
+  let tokenB = '';
+  let inspB = '';
+  let albumB = '';
+  let tagB = '';
+
+  it('第二个库造出完整关联数据（打标 / 画册项 / 缺口 / 发布快照）', async () => {
+    const saved = token;
+    const userB = await call('post', '/api/auth/register', {
+      email: 'owner-b@test.local',
+      password: 'password123',
+      displayName: '库B所有者',
+    });
+    expect(userB.status).toBe(201);
+    tokenB = userB.body.token;
+    token = tokenB;
+
+    // B 库基线标签与 A 库同名但 id 不同（每库一套）
+    const tags = await call('get', '/api/tags');
+    const flat = (tags.body.items as { children?: { id: string; name: string }[] }[]).flatMap(
+      (g) => g.children ?? [],
+    );
+    tagB = flat.find((t) => t.name === '逆光')!.id;
+    expect(tagB).toBeTruthy();
+    expect(tagB).not.toBe(tagIds['逆光']);
+
+    const insp = await call('post', '/api/inspirations', { title: 'B库专属卡片' });
+    inspB = insp.body.id;
+    await call('post', '/api/inspirations/bulk-tag', { ids: [inspB], addTagIds: [tagB] });
+
+    const album = await call('post', '/api/albums', {
+      title: 'B库画册',
+      rules: {
+        requireTags: [{ tagIds: [tagB], min: 1, required: true }],
+        totalMin: 1,
+        autoMatch: { enabled: true, minTagHits: 1 },
+      },
+    });
+    expect(album.status).toBe(201);
+    albumB = album.body.id;
+    await call('post', `/api/albums/${albumB}/auto-match`, {});
+    const publish = await call('post', `/api/albums/${albumB}/publish`, { createShare: false });
+    expect(publish.status).toBe(201);
+
+    token = saved;
+  });
+
+  it('B 库导出：含自己的关联记录，不带出 A 库任何 id', async () => {
+    const saved = token;
+    token = tokenB;
+    const res = await call('get', '/api/export/inspirations.json');
+    token = saved;
+    expect(res.status).toBe(200);
+    const data = res.body;
+
+    // 正向：B 自己的数据与直接关系都在
+    const inspRows = data.inspiration as { id: string; library_id: string }[];
+    expect(inspRows.map((r) => r.id)).toContain(inspB);
+    expect(inspRows.every((r) => r.library_id === data.libraryId)).toBe(true);
+
+    const inspIds = new Set(inspRows.map((r) => r.id));
+    const tagIdsB = new Set((data.tag as { id: string }[]).map((r) => r.id));
+    const albumIdsB = new Set((data.album as { id: string }[]).map((r) => r.id));
+    expect(albumIdsB.has(albumB)).toBe(true);
+
+    // 无 library_id 的关联表：每一行两端都必须落在本库导出的集合内
+    for (const row of data.inspiration_tag as { inspiration_id: string; tag_id: string }[]) {
+      expect(inspIds.has(row.inspiration_id)).toBe(true);
+      expect(tagIdsB.has(row.tag_id)).toBe(true);
+    }
+    expect(
+      (data.inspiration_tag as { inspiration_id: string; tag_id: string }[]).some(
+        (r) => r.inspiration_id === inspB && r.tag_id === tagB,
+      ),
+    ).toBe(true);
+
+    for (const row of data.album_item as { album_id: string; inspiration_id: string }[]) {
+      expect(albumIdsB.has(row.album_id)).toBe(true);
+      expect(inspIds.has(row.inspiration_id)).toBe(true);
+    }
+    for (const row of data.album_gap as { album_id: string }[]) {
+      expect(albumIdsB.has(row.album_id)).toBe(true);
+    }
+    const snapshots = data.album_snapshot as { album_id: string }[];
+    expect(snapshots.length).toBeGreaterThan(0);
+    for (const row of snapshots) {
+      expect(albumIdsB.has(row.album_id)).toBe(true);
+    }
+
+    // B 库没有机位，A 库有：spot 表必须为空（证明没有全表导出）
+    expect(data.spot).toEqual([]);
+
+    // 反向清扫：A 库已知 id 不得出现在 B 的导出里的任何角落
+    const raw = JSON.stringify(data);
+    for (const leaked of [cardId, albumId, spotId, planId, linkId, shareToken, tagIds['逆光']]) {
+      expect(raw).not.toContain(leaked);
+    }
+  });
+
+  it('A 库导出：含自己的数据，不带出 B 库任何 id', async () => {
+    const res = await call('get', '/api/export/inspirations.json');
+    expect(res.status).toBe(200);
+    const data = res.body;
+
+    const inspIds = (data.inspiration as { id: string }[]).map((r) => r.id);
+    expect(inspIds).toContain(cardId);
+    expect((data.album_snapshot as unknown[]).length).toBeGreaterThan(0);
+
+    const raw = JSON.stringify(data);
+    for (const leaked of [inspB, albumB, tagB]) {
+      expect(raw).not.toContain(leaked);
+    }
+  });
+});
